@@ -1,0 +1,358 @@
+"""Route generation rules, readiness, lifecycle, coordinator controls, results."""
+from __future__ import annotations
+
+import random
+from datetime import timedelta
+
+from sqlalchemy import select
+
+from app.core.timeutil import utcnow
+from app.database import SessionLocal
+from app.models import AdminAction, GameEvent, Team
+from app.services import route_service
+from app.services.event_service import split_sentence
+from tests.helpers import clear_checkpoint, face_cards_of, get_event, get_team, key, route_of, scan, seed, set_team
+
+API = "/api/v1"
+
+
+def test_route_capacity_math():
+    pool = [object() for _ in range(12)]
+    assert route_service.start_capacity(12, 7) == 332640  # 11!/5!: an ordered pick of 6 of the other 11
+    assert route_service.start_capacity(7, 7) == 720  # every checkpoint visited: 6!
+    assert route_service.start_capacity(6, 7) == 0  # a route can't be longer than the pool
+    summary = route_service.capacity_summary(pool, 6, 7)
+    assert summary["feasible"] is True and summary["unique_routes"] == 12 * 332640 and summary["starting_points"] == 12
+    short = route_service.capacity_summary(pool[:5], 6, 7)
+    assert short["feasible"] is False and "Only 5" in short["message"]
+
+
+def test_each_team_gets_its_own_seven_of_the_twelve(client):
+    """The pool is 10 here (all the demo checkpoints), the route 7: every team
+    visits a different 7-stop selection, all unique, and the whole pool is used."""
+    demo = seed(client)
+    eid = demo.event_id
+    for l in client.get(f"{API}/admin/checkpoints", headers=demo.admin).json():
+        if not l["is_selected"]:
+            client.patch(f"{API}/admin/checkpoints/{l['id']}", json={"is_selected": True}, headers=demo.admin)
+    assert client.patch(f"{API}/admin/events/{eid}", json={"settings": {"route_length": 7}}, headers=demo.admin).status_code == 200
+    data = client.post(f"{API}/admin/events/{eid}/routes/generate", headers=demo.admin).json()
+    assert data["route_length"] == 7 and len(data["selected_locations"]) == 10 and data["problems"] == []
+    pool = {l["id"] for l in data["selected_locations"]}
+    seen, used = set(), set()
+    for t in data["teams"]:
+        ids = [s["location_id"] for s in t["stops"]]
+        assert len(ids) == 7 and len(set(ids)) == 7 and set(ids) <= pool
+        assert [s["face_card"] for s in t["stops"] if s["face_card"]] == ["JACK", "QUEEN", "KING"]
+        seen.add(tuple(ids))
+        used |= set(ids)
+    assert len(seen) == 6  # unique routes
+    assert used == pool  # six routes of seven over ten checkpoints: the generator spreads them over all ten
+    # The sentence is cut into 7 fragments, one per stop, and play works end to end.
+    assert client.post(f"{API}/admin/events/{eid}/lock", headers=demo.admin).status_code == 200
+    client.post(f"{API}/admin/events/{eid}/start", headers=demo.admin)
+    team = demo.teams["Dragon Warriors"]
+    st = client.get(f"{API}/me/state", headers=team["headers"]).json()
+    assert st["team"]["total_checkpoints"] == 7 and st["fragments_total"] == 7 and len(st["checkpoints"]) == 7
+    route = route_of(team["id"])
+    assert len(route) == 7
+    off_route = next(l for l in client.get(f"{API}/admin/checkpoints", headers=demo.admin).json() if l["id"] not in {r.id for r in route})
+    from tests.helpers import token_for
+    from app.database import SessionLocal
+    from app.models import Location
+
+    with SessionLocal() as db:
+        wrong = db.get(Location, off_route["id"]).qr_token
+    res = scan(client, team, wrong).json()
+    assert res["result"] == "WRONG_QR" and res["foul_added"] is True  # a checkpoint in the game but not on this route
+    assert scan(client, team, route[0].qr_token).json()["result"] == "VALID"
+    # A manual route must also be exactly 7 distinct checkpoints from the pool.
+    client.post(f"{API}/admin/events/{eid}/end", headers=demo.admin)
+    client.post(f"{API}/admin/events/{eid}/restart", headers=demo.admin)
+    client.post(f"{API}/admin/events/{eid}/unlock", headers=demo.admin)
+    ids = [r.id for r in route]
+    bad = client.put(f"{API}/admin/events/{eid}/teams/{team['id']}/route", json={"location_ids": ids[:6]}, headers=demo.admin)
+    assert bad.status_code == 400 and "exactly 7" in bad.json()["detail"]
+    swapped = ids[:6] + [off_route["id"]]
+    assert client.put(f"{API}/admin/events/{eid}/teams/{team['id']}/route", json={"location_ids": swapped}, headers=demo.admin).status_code == 200
+
+
+def test_face_cards_are_dealt_in_order():
+    rng = random.Random(7)
+    for _ in range(200):
+        faces = route_service.deal_face_cards(8, rng)
+        assert len(faces) == 8 and route_service.face_cards_ok(faces)
+    assert not route_service.face_cards_ok(["QUEEN", "JACK", "KING", None])
+    assert not route_service.face_cards_ok(["JACK", "QUEEN", None])
+    assert not route_service.face_cards_ok(["JACK", "JACK", "QUEEN", "KING"])
+
+
+def test_generated_routes_follow_every_rule(client):
+    demo = seed(client)
+    routes = {name: route_of(t["id"]) for name, t in demo.teams.items()}
+    selected = {l.id for l in next(iter(routes.values()))}
+    assert len(selected) == 8
+    seen = set()
+    for route in routes.values():
+        assert {l.id for l in route} == selected and len(route) == 8
+        seen.add(tuple(l.id for l in route))
+    assert len(seen) == len(routes)  # unique
+    starts = [r[0].id for r in routes.values()]
+    assert len(set(starts)) == len(starts)  # 6 teams, 8 starts -> all different
+    # Every team holds its own Jack, Queen and King, met in that order.
+    for name, team in demo.teams.items():
+        cards = face_cards_of(team["id"])
+        assert set(cards) == {"JACK", "QUEEN", "KING"}, name
+        order = [l.id for l in routes[name]]
+        assert order.index(cards["JACK"]) < order.index(cards["QUEEN"]) < order.index(cards["KING"]), name
+
+
+def test_face_cards_differ_between_teams(client):
+    """The cards are dealt per team: with 6 teams and 8 stops, at least two
+    teams must hold the Jack at different checkpoints. (The chance that all
+    six draws agree on a stop is 8^-5 - never in practice.)"""
+    demo = seed(client)
+    jacks = {face_cards_of(t["id"])["JACK"] for t in demo.teams.values()}
+    assert len(jacks) > 1
+
+
+def test_shared_starts_get_staggered_offsets(client):
+    demo = seed(client, settings={"staggered_start_offset_s": 90})
+    team_ids = [t["id"] for t in demo.teams.values()]
+    # Force two teams onto the same start via a manual route edit.
+    a, b = team_ids[0], team_ids[1]
+    route_b = route_of(b)
+    route_a = route_of(a)
+    new_a = [route_b[0].id] + [l.id for l in route_a if l.id != route_b[0].id]
+    # Cards follow the checkpoints they were on; put them back in visit order.
+    cards = face_cards_of(a)
+    holders = sorted(cards.values(), key=new_a.index)
+    face_cards = dict(zip(("JACK", "QUEEN", "KING"), holders))
+    res = client.put(f"{API}/admin/events/{demo.event_id}/teams/{a}/route", json={"location_ids": new_a, "face_cards": face_cards}, headers=demo.admin)
+    assert res.status_code == 200, res.text
+    offsets = sorted([get_team(a).start_offset_s, get_team(b).start_offset_s])
+    assert offsets == [0, 90]
+
+
+def test_manual_route_validation(client):
+    demo = seed(client)
+    team_id = demo.teams["Dragon Warriors"]["id"]
+    other = route_of(demo.teams["Border Runners"]["id"])
+    dup = client.put(f"{API}/admin/events/{demo.event_id}/teams/{team_id}/route", json={"location_ids": [l.id for l in other]}, headers=demo.admin)
+    assert dup.status_code == 409 and "unique" in dup.json()["detail"]
+    route = route_of(team_id)
+    ids = [l.id for l in route]
+    short = client.put(f"{API}/admin/events/{demo.event_id}/teams/{team_id}/route", json={"location_ids": ids[:-1]}, headers=demo.admin)
+    assert short.status_code == 400
+    cards = face_cards_of(team_id)
+    swapped = {"JACK": cards["KING"], "QUEEN": cards["QUEEN"], "KING": cards["JACK"]}
+    bad = client.put(f"{API}/admin/events/{demo.event_id}/teams/{team_id}/route", json={"location_ids": ids, "face_cards": swapped}, headers=demo.admin)
+    assert bad.status_code == 400 and "order" in bad.json()["detail"]
+    same = {"JACK": cards["JACK"], "QUEEN": cards["JACK"], "KING": cards["KING"]}
+    bad = client.put(f"{API}/admin/events/{demo.event_id}/teams/{team_id}/route", json={"location_ids": ids, "face_cards": same}, headers=demo.admin)
+    assert bad.status_code == 400 and "own checkpoint" in bad.json()["detail"]
+    # Without face_cards the team keeps its cards where they were...
+    reversed_ids = ids[::-1]
+    ok = client.put(f"{API}/admin/events/{demo.event_id}/teams/{team_id}/route", json={"location_ids": reversed_ids}, headers=demo.admin)
+    assert ok.status_code == 400 and "order" in ok.json()["detail"]  # ...which is now the wrong way round
+    ok = client.put(f"{API}/admin/events/{demo.event_id}/teams/{team_id}/route", json={"location_ids": ids}, headers=demo.admin)
+    assert ok.status_code == 200 and face_cards_of(team_id) == cards
+    stops = next(t for t in ok.json()["teams"] if t["team_id"] == team_id)["stops"]
+    assert [s["face_card"] for s in stops if s["face_card"]] == ["JACK", "QUEEN", "KING"]
+
+
+def test_readiness_and_lock_requirements(client):
+    demo = seed(client)
+    checks = client.get(f"{API}/admin/events/{demo.event_id}/readiness", headers=demo.admin).json()
+    assert all(c["ok"] for c in checks), checks
+    team_id = demo.teams["Spade Squad"]["id"]
+    client.patch(f"{API}/admin/events/{demo.event_id}/teams/{team_id}", json={"sentence": "TOO SHORT"}, headers=demo.admin)
+    res = client.post(f"{API}/admin/events/{demo.event_id}/lock", headers=demo.admin)
+    assert res.status_code == 409 and "sentence" in res.json()["detail"].lower()
+    assert get_event(demo.event_id).status == "DRAFT"
+
+
+def test_split_sentence():
+    assert split_sentence("A B C D E F G H I J", 8) == ["A B", "C D", "E", "F", "G", "H", "I", "J"]
+    assert split_sentence("ONE | TWO THREE | FOUR", 3) == ["ONE", "TWO THREE", "FOUR"]
+    assert split_sentence("ONE | TWO", 3) is None
+    assert split_sentence("TOO SHORT", 8) is None
+
+
+def test_lifecycle_transitions_are_guarded(client):
+    demo = seed(client)
+    eid = demo.event_id
+    assert client.post(f"{API}/admin/events/{eid}/start", headers=demo.admin).status_code == 409  # must lock first
+    assert client.post(f"{API}/admin/events/{eid}/lock", headers=demo.admin).status_code == 200
+    assert client.post(f"{API}/admin/events/{eid}/unlock", headers=demo.admin).status_code == 200
+    assert client.post(f"{API}/admin/events/{eid}/lock", headers=demo.admin).status_code == 200
+    assert client.post(f"{API}/admin/events/{eid}/start", headers=demo.admin).status_code == 200
+    again = client.post(f"{API}/admin/events/{eid}/start", headers=demo.admin)
+    assert again.status_code == 409  # the old API reset every start time here
+    # setup is frozen while live
+    team_id = demo.teams["Spade Squad"]["id"]
+    assert client.post(f"{API}/admin/events/{eid}/routes/generate", headers=demo.admin).status_code == 409
+    assert client.post(f"{API}/admin/events/{eid}/teams", json={"team_name": "Late", "password": "1234"}, headers=demo.admin).status_code == 409
+    assert client.patch(f"{API}/admin/events/{eid}/teams/{team_id}", json={"sentence": "x"}, headers=demo.admin).status_code == 409
+    assert client.post(f"{API}/admin/events/{eid}/end", headers=demo.admin).status_code == 200
+    assert client.post(f"{API}/admin/events/{eid}/pause", headers=demo.admin).status_code == 409
+
+
+def test_resume_gives_back_paused_time(client):
+    demo = seed(client, start=True)
+    team_id = demo.teams["Dragon Warriors"]["id"]
+    before = get_team(team_id).started_at
+    client.post(f"{API}/admin/events/{demo.event_id}/pause", headers=demo.admin)
+    from app.models import Event
+
+    with SessionLocal() as db:  # pretend the pause lasted 10 minutes
+        ev = db.get(Event, demo.event_id)
+        ev.paused_at = utcnow() - timedelta(minutes=10)
+        db.commit()
+    client.post(f"{API}/admin/events/{demo.event_id}/resume", headers=demo.admin)
+    shift = (get_team(team_id).started_at - before).total_seconds()
+    assert 590 <= shift <= 610
+
+
+def test_coordinator_controls_are_audited(client):
+    demo = seed(client, start=True)
+    eid, team = demo.event_id, demo.teams["Border Runners"]
+    base = f"{API}/admin/events/{eid}/teams/{team['id']}"
+    assert client.post(f"{base}/foul", json={"action": "add", "reason": "cut through the garden"}, headers=demo.admin).json()["foul_count"] == 1
+    assert client.post(f"{base}/foul", json={"action": "remove", "reason": "disputed"}, headers=demo.admin).json()["foul_count"] == 0
+    assert client.post(f"{base}/foul", json={"action": "remove"}, headers=demo.admin).status_code == 409
+    assert client.post(f"{base}/freeze", json={"duration_s": 60}, headers=demo.admin).json()["frozen_until"]
+    assert client.post(f"{base}/unfreeze", headers=demo.admin).status_code == 200
+    scan(client, team, route_of(team["id"])[0].qr_token)
+    assert client.post(f"{base}/unlock-puzzle", json={"reason": "prop missing"}, headers=demo.admin).json()["status"] == "ACTIVE"
+    assert client.post(f"{base}/verify-joker", headers=demo.admin).status_code == 409  # not FINAL yet
+    assert client.post(f"{base}/disqualify", json={"reason": "used a car"}, headers=demo.admin).json()["status"] == "DISQUALIFIED"
+    assert scan(client, team, route_of(team["id"])[1].qr_token).status_code == 409
+    assert client.post(f"{base}/reinstate", headers=demo.admin).json()["status"] == "ACTIVE"
+
+    admin_log = client.get(f"{API}/admin/events/{eid}/logs", params={"log": "admin"}, headers=demo.admin).json()
+    kinds = [r["kind"] for r in admin_log]
+    for expected in ("FOUL_ADDED", "FOUL_REMOVED", "TEAM_FROZEN", "TEAM_UNFROZEN", "PUZZLE_UNLOCKED", "TEAM_DISQUALIFIED", "TEAM_REINSTATED"):
+        assert expected in kinds
+    game_log = client.get(f"{API}/admin/events/{eid}/logs", params={"log": "game"}, headers=demo.admin).json()
+    assert not {"FOUL_ADDED", "TEAM_DISQUALIFIED"} & {r["kind"] for r in game_log}  # the two logs stay separate
+
+
+def test_ranking_uses_fouls_then_time(client):
+    demo = seed(client, start=True)
+    fast_foul, slow_clean = demo.teams["Dragon Warriors"], demo.teams["Border Runners"]
+    for team in (fast_foul, slow_clean):
+        for loc in route_of(team["id"]):
+            clear_checkpoint(client, team, loc)
+        client.post(f"{API}/admin/events/{demo.event_id}/teams/{team['id']}/verify-joker", headers=demo.admin)
+    now = utcnow()
+    set_team(fast_foul["id"], started_at=now - timedelta(minutes=20), completed_at=now, foul_count=2)
+    set_team(slow_clean["id"], started_at=now - timedelta(minutes=40), completed_at=now, foul_count=0)
+    results = client.get(f"{API}/admin/events/{demo.event_id}/results", headers=demo.admin).json()
+    names = [r["team_name"] for r in results["coordinator"]]
+    assert names[:2] == ["Border Runners", "Dragon Warriors"]
+    assert results["coordinator"][1]["foul_count"] == 2
+    assert all("foul_count" not in r for r in results["public"])
+    export = client.get(f"{API}/admin/events/{demo.event_id}/results/export", headers=demo.admin)
+    assert export.status_code == 200 and export.content[:2] == b"PK"
+
+
+def test_dashboard_shows_everything_to_coordinators(client):
+    demo = seed(client, start=True)
+    team = demo.teams["Joker's Wild"]
+    scan(client, team, route_of(team["id"])[0].qr_token)
+    dash = client.get(f"{API}/admin/events/{demo.event_id}/dashboard", headers=demo.admin).json()
+    row = next(r for r in dash["teams"] if r["id"] == team["id"])
+    assert row["status"] == "PUZZLE_LOCKED" and row["target"]["code"].startswith("L")
+    assert dash["counts"]["teams"] == 6 and dash["recent"]
+
+
+def test_one_game_reuses_the_checkpoint_library_run_after_run(client):
+    """A broken run is ended and reset: the same checkpoints, routes
+    generated again, the same QR stickers on the walls."""
+    demo = seed(client, start=True)
+    assert client.get(f"{API}/admin/event", headers=demo.admin).json()["id"] == demo.event_id  # the one game
+    library = {l["code"]: l for l in client.get(f"{API}/admin/checkpoints", headers=demo.admin).json()}
+    assert len(library) == 10 and sum(l["is_selected"] for l in library.values()) == 8
+    # While an event is running the set of checkpoints is frozen...
+    in_use = client.get(f"{API}/admin/checkpoints/in-use", headers=demo.admin).json()["event"]
+    assert in_use["id"] == demo.event_id and in_use["status"] == "LIVE"
+    l09 = library["L09"]
+    blocked = client.patch(f"{API}/admin/checkpoints/{l09['id']}", json={"is_selected": True}, headers=demo.admin)
+    assert blocked.status_code == 409 and "LIVE" in blocked.json()["detail"]
+    assert client.delete(f"{API}/admin/checkpoints/{l09['id']}", headers=demo.admin).status_code == 409
+    assert client.post(f"{API}/admin/checkpoints/{l09['id']}/regenerate-qr", headers=demo.admin).status_code == 409
+    # ...but a name or GPS point can be fixed on the day.
+    assert client.patch(f"{API}/admin/checkpoints/{l09['id']}", json={"name": "Innovation Hub (side door)"}, headers=demo.admin).status_code == 200
+
+    # Something went wrong: end it, reset it, unlock it - the library is editable again...
+    eid = demo.event_id
+    client.post(f"{API}/admin/events/{eid}/end", headers=demo.admin)
+    assert client.get(f"{API}/admin/checkpoints/in-use", headers=demo.admin).json()["event"] is None  # ended: not in use
+    assert client.post(f"{API}/admin/events/{eid}/restart", headers=demo.admin).status_code == 200  # -> CONFIGURED
+    assert client.post(f"{API}/admin/events/{eid}/unlock", headers=demo.admin).status_code == 200  # -> DRAFT
+    assert client.get(f"{API}/admin/checkpoints/in-use", headers=demo.admin).json()["event"] is None
+    assert client.patch(f"{API}/admin/checkpoints/{l09['id']}", json={"is_selected": True}, headers=demo.admin).status_code == 200
+    assert client.patch(f"{API}/admin/checkpoints/{l09['id']}", json={"is_selected": False}, headers=demo.admin).status_code == 200
+    # ...and the same checkpoints and stickers route the next run.
+    again = {l["code"]: l for l in client.get(f"{API}/admin/checkpoints", headers=demo.admin).json()}
+    assert {c: l["id"] for c, l in again.items()} == {c: l["id"] for c, l in library.items()}  # the very same rows
+    assert all(again[c]["qr_token"] == library[c]["qr_token"] for c in library)  # stickers still valid
+    routes = client.post(f"{API}/admin/events/{eid}/routes/generate", headers=demo.admin).json()
+    assert {s["code"] for s in routes["teams"][0]["stops"]} == {c for c, l in library.items() if l["is_selected"]}
+    assert client.post(f"{API}/admin/events/{eid}/lock", headers=demo.admin).status_code == 200
+    assert client.post(f"{API}/admin/events/{eid}/start", headers=demo.admin).status_code == 200
+
+
+def test_restart_discards_the_run_and_keeps_the_setup(client):
+    demo = seed(client, start=True)
+    eid = demo.event_id
+    a, t = demo.teams["Dragon Warriors"], demo.teams["Border Runners"]
+    route_a = route_of(a["id"])
+    clear_checkpoint(client, a, route_a[0])  # progress, a puzzle session, a face card maybe
+    client.post(f"{API}/admin/events/{eid}/teams/{t['id']}/foul", json={"action": "add", "reason": "test"}, headers=demo.admin)
+    usage = client.post(f"{API}/powers/attack", json={"kind": "FREEZE", "target_team_id": t["id"], "idempotency_key": key()}, headers=a["headers"]).json()
+    client.post(f"{API}/powers/defend", json={"usage_id": usage["usage_id"], "defence": None, "idempotency_key": key()}, headers=t["headers"])
+    assert get_team(t["id"]).frozen_until is not None and get_team(t["id"]).foul_count == 1
+    assert client.post(f"{API}/admin/events/{eid}/restart", headers=demo.admin).status_code == 200
+
+    assert get_event(eid).status == "CONFIGURED" and get_event(eid).started_at is None
+    for team in (a, t):
+        row = get_team(team["id"])
+        assert row.status == "WAITING" and row.progress == 0 and row.foul_count == 0
+        assert row.started_at is None and row.frozen_until is None and row.jack_found_at is None
+        state = client.get(f"{API}/me/state", headers=team["headers"]).json()
+        assert state["team"]["status"] == "WAITING" and state["fragments"] == [] and state["puzzle"] is None
+        inv = {p["kind"]: p for p in state["powers"]["items"]}
+        assert inv["FREEZE"]["owned"] == 1 and inv["FREEZE"]["used"] == 0  # purchases kept, uses reset
+    assert [l.id for l in route_of(a["id"])] == [l.id for l in route_a]  # the setup survived
+    with SessionLocal() as db:
+        from app.models import PuzzleSession, Scan
+
+        assert db.scalar(select(PuzzleSession).where(PuzzleSession.team_id == a["id"])) is None
+        assert db.scalar(select(Scan).where(Scan.event_id == eid)) is None
+    log = client.get(f"{API}/admin/events/{eid}/logs", params={"log": "admin"}, headers=demo.admin).json()
+    assert "EVENT_RESTARTED" in {r["kind"] for r in log} and "FOUL_ADDED" in {r["kind"] for r in log}  # audit trail kept
+    game = client.get(f"{API}/admin/events/{eid}/logs", params={"log": "game"}, headers=demo.admin).json()
+    assert [r["kind"] for r in game] == ["EVENT_RESTARTED"]  # the run's game log is gone
+
+    # ...and it plays again from the top.
+    assert client.post(f"{API}/admin/events/{eid}/start", headers=demo.admin).status_code == 200
+    res = scan(client, a, route_a[0].qr_token).json()
+    assert res["result"] == "VALID" and res["checkpoint"] == 1
+
+
+def test_restart_can_refund_powers_and_works_after_end(client):
+    demo = seed(client, start=True)
+    eid = demo.event_id
+    team = demo.teams["Spade Squad"]
+    assert client.post(f"{API}/admin/events/{eid}/restart", json={"refund_powers": True}, headers=demo.admin).status_code == 200
+    state = client.get(f"{API}/me/state", headers=team["headers"]).json()
+    assert state["team"]["power_points"] == 100 and all(p["owned"] == 0 for p in state["powers"]["items"])
+    assert state["powers"]["purchase_open"] is True  # CONFIGURED: the shop is open again
+    client.post(f"{API}/admin/events/{eid}/start", headers=demo.admin)
+    client.post(f"{API}/admin/events/{eid}/end", headers=demo.admin)
+    assert client.post(f"{API}/admin/events/{eid}/restart", headers=demo.admin).status_code == 200  # from ENDED too
+    assert get_event(eid).status == "CONFIGURED" and get_event(eid).ended_at is None
+    client.post(f"{API}/admin/events/{eid}/unlock", headers=demo.admin)
+    assert client.post(f"{API}/admin/events/{eid}/restart", headers=demo.admin).status_code == 409  # nothing to restart in DRAFT
